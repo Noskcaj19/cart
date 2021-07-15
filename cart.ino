@@ -6,9 +6,12 @@
 #include <SoftwareSerial.h>
 #include <Wire.h>
 
+// Configuration
+const float STEERING_ADJUSTMENT_PERCENTAGE = 0.1;
+const float SPEED_ADJUSTMENT_PERCENTAGE    = 0.1;
 
 const bool REVERSE_LEFT  = false;
-const bool REVERSE_RIGHT = false;
+const bool REVERSE_RIGHT = true;
 
 // Motor controllers
 const int MOTOR1_IN1 = 9;
@@ -31,15 +34,39 @@ Adafruit_BluefruitLE_SPI ble(BLUEFRUIT_SPI_SCK, BLUEFRUIT_SPI_MISO,
                              BLUEFRUIT_SPI_MOSI, BLUEFRUIT_SPI_CS,
                              BLUEFRUIT_SPI_IRQ, BLUEFRUIT_SPI_RST);
 
-double speed    = 1;   // 0 = 0%, 1 = 100% output
+// Runtime variables
+double speed    = 0.0; // -1 = -100% output, 0 = 0%, 1 = 100% output
 double steering = 0.0; // -1 = full left, 0 = center, 1 = full right
 
-typedef struct MotorSpeeds {
+double last_velocity[3] = {0};
+double displacement[3]  = {0};
+
+unsigned long lastMillis = 0;
+
+void updateDisplacement(double accel_x_g, double accel_y_g, double accel_z_g,
+                        double time_dt) {
+  double accel_g[3]           = {0};
+  double accel_m_s2[3]        = {0};
+  double curr_velocity_m_s[3] = {0};
+  // float sample_time         = (1.0f / update_rate_hz);
+  accel_g[0] = accel_x_g;
+  accel_g[1] = accel_y_g;
+  accel_g[2] = accel_z_g;
+  for (int i = 0; i < 3; i++) {
+    accel_m_s2[i]        = accel_g[i] * 9.80665f;
+    curr_velocity_m_s[i] = last_velocity[i] + (accel_m_s2[i] * time_dt);
+    displacement[i] +=
+        last_velocity[i] + (0.5f * accel_m_s2[i] * time_dt * time_dt);
+    last_velocity[i] = curr_velocity_m_s[i];
+  }
+}
+
+struct MotorSpeeds {
   double left;
   double right;
-} MotorSpeeds;
+};
 
-MotorSpeeds calcMotorPercents(double xSpeed, double zRotation) {
+struct MotorSpeeds calcMotorPercents(double xSpeed, double zRotation) {
   double leftSpeed;
   double rightSpeed;
 
@@ -76,8 +103,8 @@ MotorSpeeds calcMotorPercents(double xSpeed, double zRotation) {
 
 void updateMotors(double speed, double steering) {
   MotorSpeeds speeds     = calcMotorPercents(speed, steering);
-  double      leftSpeed  = int(constrain(speeds.left, 0, 1) * 255);
-  double      rightSpeed = int(constrain(speeds.right, 0, 1) * 255);
+  double      leftSpeed  = int(constrain(speeds.left, -1, 1) * 255);
+  double      rightSpeed = int(constrain(speeds.right, -1, 1) * 255);
 
   if (REVERSE_LEFT) {
     leftSpeed *= -1;
@@ -123,18 +150,28 @@ void setup(void) {
   Serial.println("Waiting for BLE...");
   if (!ble.begin(false))
     for (;;)
-      ; // BLE init error? LED on forever
+      ; // BLE init error?
   ble.echo(false);
   Serial.println("BLE ready");
   pinMode(MOTOR1_IN1, OUTPUT);
   pinMode(MOTOR1_IN2, OUTPUT);
   pinMode(MOTOR2_IN1, OUTPUT);
   pinMode(MOTOR2_IN2, OUTPUT);
+
+  if (!lis.begin(0x18)) { // change this to 0x19 for alternative i2c address
+    Serial.println("Couldnt start Adafruit_LIS3DH");
+  }
+  lis.setRange(LIS3DH_RANGE_4_G);
+
   Serial.println("Setup complete");
 }
 
 void loop(void) {
+  unsigned long currentMillis = millis();
   // TX Command: AT+BLEUARTTX
+
+  lis.read();
+  updateDisplacement(lis.x_g, lis.y_g, lis.z_g, currentMillis - lastMillis);
 
   // Process any pending Bluetooth input
   if (ble.isConnected()) {
@@ -148,23 +185,33 @@ void loop(void) {
       case '1':
         speed = 1.0; // Max speed
         break;
+      // case '2':
+      //   speed = -1.0; // Max reverse
+      //   break;
       case '3':
         speed = 0.0; // Stop
         break;
+      case '4':
+        steering = 0.0; // Center steering
+        break;
       case '5': // Up (faster)
-        speed = constrain(speed + 0.1, 0, 1);
+        speed = constrain(speed + SPEED_ADJUSTMENT_PERCENTAGE, -1, 1);
         break;
       case '6': // Down (slower)
-        speed = constrain(speed - 0.1, 0, 1);
+        speed = constrain(speed - SPEED_ADJUSTMENT_PERCENTAGE, -1, 1);
         break;
       case '7': // Left
-        steering = constrain(steering - 0.1, -1, 1);
+        steering = constrain(steering - STEERING_ADJUSTMENT_PERCENTAGE, -1, 1);
         break;
       case '8': // Right
-        steering = constrain(steering + 0.1, -1, 1);
+        steering = constrain(steering + STEERING_ADJUSTMENT_PERCENTAGE, -1, 1);
         break;
       }
     }
+    ble.println("AT+BLEUARTTX=x:" + String(displacement[0], 2) +
+                ",y:" + String(displacement[1], 2) +
+                ",z:" + String(displacement[2], 2));
   }
   updateMotors(speed, steering);
+  lastMillis = currentMillis;
 }
